@@ -1,1 +1,184 @@
+name: Process Satellite Data
 
+  on:
+    schedule:
+      # Run daily at midnight UTC
+      - cron: '0 0 * * *'
+    workflow_dispatch: # Allow manual triggering for testing
+
+  jobs:
+    fetch-satellite-data:
+      runs-on: ubuntu-latest
+
+      steps:
+        - name: Checkout repository
+          uses: actions/checkout@v4
+          with:
+            token: ${{ secrets.GITHUB_TOKEN }}
+
+        - name: Setup Node.js
+          uses: actions/setup-node@v4
+          with:
+            node-version: '20'
+
+        - name: Create package.json
+          run: |
+            cat > package.json << 'EOF'
+            {
+              "name": "satellite-data-processor",
+              "version": "1.0.0",
+              "type": "module",
+              "description": "CelestTrak satellite data processor",
+              "main": "fetch-satellites.js",
+              "scripts": {
+                "fetch": "node fetch-satellites.js"
+              }
+            }
+            EOF
+
+        - name: Create fetch script
+          run: |
+            cat > fetch-satellites.js << 'EOF'
+            #!/usr/bin/env node
+
+            import https from 'https';
+            import fs from 'fs';
+            import path from 'path';
+
+            const CELESTRAK_GP_API = 'https://celestrak.org/NORAD/elements/gp.php';
+
+            // All constellation IDs
+            const constellations = [
+              'last-30-days', 'stations', 'visual', 'active', 'analyst',
+              'cosmos-1408-debris', 'fengyun-1c-debris', 'iridium-33-debris', 'cosmos-2251-debris',
+              'weather', 'noaa', 'goes', 'resource', 'sarsat', 'disaster',
+              'tdrss', 'argos', 'planet', 'spire',
+              'geo', 'gpz', 'gpz-plus', 'intelsat', 'ses', 'eutelsat', 'telesat',
+              'starlink', 'oneweb', 'qianfan', 'hulianwang', 'kuiper', 'iridium-next',
+              'orbcomm', 'globalstar', 'amateur', 'satnogs', 'x-comm', 'other-comm',
+              'gnss', 'gps-ops', 'glo-ops', 'galileo', 'beidou', 'sbas', 'nnss', 'musson',
+              'science', 'geodetic', 'engineering', 'education',
+              'military', 'radar', 'cubesat', 'other'
+            ];
+
+            function fetchConstellationJSON(constellationId) {
+              return new Promise((resolve) => {
+                const url = `${CELESTRAK_GP_API}?GROUP=${constellationId}&FORMAT=json`;
+                console.log(`Fetching ${constellationId}...`);
+
+                https.get(url, (res) => {
+                  if (res.statusCode === 403) {
+                    console.warn(`Rate limited ${constellationId}: HTTP ${res.statusCode} - skipping`);
+                    resolve([]);
+                    return;
+                  }
+                  if (res.statusCode !== 200) {
+                    console.warn(`Failed ${constellationId}: HTTP ${res.statusCode}`);
+                    resolve([]);
+                    return;
+                  }
+
+                  let data = '';
+                  res.on('data', (chunk) => data += chunk);
+                  res.on('end', () => {
+                    try {
+                      if (!data.trim() || data.startsWith('Invalid')) {
+                        console.warn(`Invalid response ${constellationId}: ${data.substring(0,
+  50)}...`);
+                        resolve([]);
+                        return;
+                      }
+
+                      const satellites = JSON.parse(data);
+                      console.log(`✓ ${constellationId}: ${satellites.length} satellites`);
+                      resolve(satellites.map(sat => ({
+                        ...sat,
+                        CONSTELLATION_ID: constellationId
+                      })));
+                    } catch (error) {
+                      console.warn(`Parse error ${constellationId}:`, error.message);
+                      resolve([]);
+                    }
+                  });
+                }).on('error', (error) => {
+                  console.warn(`Network error ${constellationId}:`, error.message);
+                  resolve([]);
+                });
+              });
+            }
+
+            async function fetchAllSatellites() {
+              console.log(`Fetching ${constellations.length} constellations...`);
+
+              const allSatellites = [];
+              let totalCount = 0;
+
+              for (const constellationId of constellations) {
+                const satellites = await fetchConstellationJSON(constellationId);
+                allSatellites.push(...satellites);
+                totalCount += satellites.length;
+
+                // Delay to avoid rate limiting
+                await new Promise(resolve => setTimeout(resolve, 2500));
+              }
+
+              const outputData = {
+                metadata: {
+                  fetchDate: new Date().toISOString(),
+                  totalConstellations: constellations.length,
+                  totalSatellites: totalCount,
+                  source: 'CelesTrak GP API',
+                  description: 'Complete satellite database with orbital elements from all 
+  constellations'
+                },
+                satellites: allSatellites
+              };
+
+              // Ensure data directory exists
+              if (!fs.existsSync('data')) {
+                fs.mkdirSync('data', { recursive: true });
+              }
+
+              const outputFile = 'data/satellite-data.json';
+              fs.writeFileSync(outputFile, JSON.stringify(outputData, null, 2));
+
+              console.log(`✓ Complete! ${totalCount} satellites saved to: ${outputFile}`);
+              console.log(`File size: ${(fs.statSync(outputFile).size / 1024 / 1024).toFixed(2)} MB`);
+            }
+
+            fetchAllSatellites().catch(console.error);
+            EOF
+
+        - name: Fetch satellite data from CelestTrak
+          run: node fetch-satellites.js
+
+        - name: Verify data file was created
+          run: |
+            if [ ! -f "data/satellite-data.json" ]; then
+              echo "Error: Satellite data file was not created"
+              exit 1
+            fi
+
+            FILE_SIZE=$(du -h "data/satellite-data.json" | cut -f1)
+            echo "Generated satellite data file size: $FILE_SIZE"
+
+            # Basic JSON validation
+            node -e "JSON.parse(require('fs').readFileSync('data/satellite-data.json', 'utf8')); 
+  console.log('✓ JSON validation passed')"
+
+        - name: Configure Git
+          run: |
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+
+        - name: Commit and push satellite data
+          run: |
+            git add data/satellite-data.json
+
+            if git diff --staged --quiet; then
+              echo "No changes to satellite data"
+            else
+              git commit -m "Update satellite data - $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+              git push
+              echo "✓ Satellite data updated and pushed"
+            fi
